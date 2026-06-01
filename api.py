@@ -1,122 +1,167 @@
 """
-flask_api.py – Skin Cancer SVM Classifier (Flask)
-==================================================
-Single-file REST API for testing the trained SVM model.
-
-Endpoints:
-    GET  /health       – model status
-    POST /predict      – upload one image, get prediction
-
-Run:
-    pip install flask pillow scikit-learn numpy joblib
-    python flask_api.py
+Teralit Skin Disease Classifier — Flask API (YOLO backend)
+Datasets: https://github.com/Liyang-A-O/Streamlit-Teralit
+Endpoint: POST /predict
+Input  : multipart/form-data with field "image" (jpg/png/webp)
+Output : JSON with modelLoaded, predictedClass, diagnosis,
+         confidence, riskLevel, probabilities
 """
 
+import os
 import io
-import joblib
+import logging
 import numpy as np
-from pathlib import Path
 from PIL import Image
+
 from flask import Flask, request, jsonify
+from ultralytics import YOLO
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-MODEL_PATH   = "outputs/svm_skin_cancer.pkl"
-ENCODER_PATH = "outputs/label_encoder.pkl"
-IMG_SIZE     = (64, 64)
+# ── Logging ────────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
-CLASS_LABELS = {
-    "akiec": "Actinic Keratoses and Intraepithelial Carcinoma",
-    "bcc":   "Basal Cell Carcinoma",
-    "bkl":   "Benign Keratosis-like Lesions",
-    "df":    "Dermatofibroma",
-    "mel":   "Melanoma",
-    "nv":    "Melanocytic Nevi",
-    "vasc":  "Vascular Lesions",
-}
-
-RISK_LEVEL = {
-    "mel":   "HIGH",
-    "akiec": "MODERATE",
-    "bcc":   "MODERATE",
-    "bkl":   "LOW",
-    "df":    "LOW",
-    "nv":    "LOW",
-    "vasc":  "LOW",
-}
-
-# ── Load model at startup ──────────────────────────────────────────────────────
-pipeline      = None
-label_encoder = None
-model_error   = None
-
-try:
-    pipeline      = joblib.load(MODEL_PATH)
-    label_encoder = joblib.load(ENCODER_PATH)
-    print(f"✓ Model loaded from {MODEL_PATH}")
-except Exception as e:
-    model_error = str(e)
-    print(f"✗ Could not load model: {e}")
-
-# ── Flask app ──────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
+# ── Config ─────────────────────────────────────────────────────────────────────
+MODEL_DIR   = os.getenv("MODEL_DIR", "saved_models")
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "10"))
+IMG_SIZE    = int(os.getenv("IMG_SIZE", "224"))
+RISK_MAP = {
+    "high":   ["melanoma"],
+    "medium": ["chickenpox", "eczema", "hives"],
+    "low":    [],
+}
 
-@app.get("/health")
-def health():
-    return jsonify({
-        "status":       "ok" if pipeline is not None else "degraded",
-        "model_loaded": pipeline is not None,
-        "model_path":   MODEL_PATH,
-        "error":        model_error,
-    })
+
+def get_risk_level(class_name: str) -> str:
+    name_lower = class_name.lower()
+    for level in ("high", "medium", "low"):
+        for keyword in RISK_MAP[level]:
+            if keyword in name_lower:
+                return level
+    return "medium"
 
 
-@app.post("/predict")
+# ── Model loading ──────────────────────────────────────────────────────────────
+_model       = None
+_class_names = []
+_num_classes = 0
+_model_ok    = False
+
+
+def load_model_assets():
+    global _model, _class_names, _num_classes, _model_ok
+
+    import glob
+    pt_files = sorted(glob.glob(os.path.join(MODEL_DIR, "*.pt")))
+    if not pt_files:
+        logger.error("No .pt model found in %s", MODEL_DIR)
+        return
+    pt_path = pt_files[-1]  # use the latest if multiple exist
+
+    logger.info("Loading YOLO model from %s …", pt_path)
+    _model = YOLO(pt_path)
+    logger.info("YOLO model loaded.")
+
+    raw_names = _model.names
+    if isinstance(raw_names, dict):
+        _num_classes = len(raw_names)
+        _class_names = [raw_names[i] for i in range(_num_classes)]
+    else:
+        _class_names = list(raw_names)
+        _num_classes = len(_class_names)
+
+    _model_ok = True
+    logger.info("Ready. img_size=%d classes=%s", IMG_SIZE, _class_names)
+
+
+load_model_assets()
+
+
+# ── /predict ───────────────────────────────────────────────────────────────────
+@app.route("/predict", methods=["POST"])
 def predict():
-    # ── 1. Model ready? ────────────────────────────────────────────────────────
-    if pipeline is None:
-        return jsonify({
-            "model_loaded": False,
-            "error": f"Model not loaded: {model_error}"
-        }), 503
+    model_loaded = _model_ok
 
-    # ── 2. Image in request? ───────────────────────────────────────────────────
     if "image" not in request.files:
-        return jsonify({"error": "No image provided. Send a file under the key 'image'."}), 400
+        return jsonify({"modelLoaded": model_loaded, "predictedClass": None,
+                        "diagnosis": None, "confidence": None,
+                        "riskLevel": None, "probabilities": None,
+                        "error": "No 'image' field in request."}), 400
 
     file = request.files["image"]
     if file.filename == "":
-        return jsonify({"error": "Empty filename."}), 400
+        return jsonify({"modelLoaded": model_loaded, "predictedClass": None,
+                        "diagnosis": None, "confidence": None,
+                        "riskLevel": None, "probabilities": None,
+                        "error": "Empty filename."}), 400
 
-    # ── 3. Preprocess ──────────────────────────────────────────────────────────
+    file.seek(0, 2); size_mb = file.tell() / 1e6; file.seek(0)
+    if size_mb > MAX_FILE_MB:
+        return jsonify({"modelLoaded": model_loaded, "predictedClass": None,
+                        "diagnosis": None, "confidence": None,
+                        "riskLevel": None, "probabilities": None,
+                        "error": f"File too large ({size_mb:.1f} MB). Max {MAX_FILE_MB} MB."}), 413
+
+    if not _model_ok:
+        return jsonify({"modelLoaded": False, "predictedClass": None,
+                        "diagnosis": None, "confidence": None,
+                        "riskLevel": None, "probabilities": None,
+                        "error": "Model not loaded. Check server logs."}), 503
+
     try:
-        img = Image.open(io.BytesIO(file.read())).convert("RGB").resize(IMG_SIZE)
-        x   = np.array(img, dtype=np.float32).flatten() / 255.0
+        pil_img = Image.open(io.BytesIO(file.read())).convert("RGB")
     except Exception as e:
-        return jsonify({"error": f"Could not process image: {e}"}), 422
+        return jsonify({"modelLoaded": model_loaded, "predictedClass": None,
+                        "diagnosis": None, "confidence": None,
+                        "riskLevel": None, "probabilities": None,
+                        "error": f"Cannot open image: {e}"}), 422
 
-    # ── 4. Inference ───────────────────────────────────────────────────────────
     try:
-        predicted_class = pipeline.predict([x])[0]
-        proba           = pipeline.predict_proba([x])[0]
+        results = _model.predict(source=pil_img, imgsz=IMG_SIZE,
+                                 verbose=False)
+        result = results[0]
+
+        probs_tensor = result.probs.data.cpu().numpy()
+
+        pred_idx   = int(np.argmax(probs_tensor))
+        pred_class = _class_names[pred_idx]
+        confidence = float(probs_tensor[pred_idx])
+
+        probabilities = {
+            _class_names[i]: round(float(probs_tensor[i]), 6)
+            for i in range(_num_classes)
+        }
+
+        return jsonify({
+            "modelLoaded":    True,
+            "predictedClass": pred_class,
+            "diagnosis":      pred_class,
+            "confidence":     confidence,
+            "riskLevel":      get_risk_level(pred_class),
+            "probabilities":  probabilities,
+        })
+
     except Exception as e:
-        return jsonify({"error": f"Inference failed: {e}"}), 500
+        logger.exception("Inference error")
+        return jsonify({"modelLoaded": model_loaded, "predictedClass": None,
+                        "diagnosis": None, "confidence": None,
+                        "riskLevel": None, "probabilities": None,
+                        "error": f"Inference failed: {e}"}), 500
 
-    # ── 5. Build response ──────────────────────────────────────────────────────
-    prob_dict = {
-        cls: round(float(p), 6)
-        for cls, p in zip(label_encoder.classes_, proba)
-    }
 
+# ── /health ────────────────────────────────────────────────────────────────────
+@app.route("/health", methods=["GET"])
+def health():
     return jsonify({
-        "modelLoaded":    True,
-        "predictedClass": predicted_class,
-        "diagnosis":           CLASS_LABELS.get(predicted_class, predicted_class),
-        "confidence":      round(float(proba.max()), 6),
-        "riskLevel":      RISK_LEVEL.get(predicted_class, "UNKNOWN"),
-        "probabilities":   prob_dict,
+        "status":      "ok" if _model_ok else "degraded",
+        "modelLoaded": _model_ok,
+        "numClasses":  _num_classes,
+        "classNames":  _class_names,
+        "imgSize":     [IMG_SIZE, IMG_SIZE],
     })
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=False)
